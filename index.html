@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 令牌在地址的 # 片段里，禁止把来源地址带给任何第三方 -->
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>重置密码 · 心意管家</title>
+<style>
+  /* 取值对应 App 设计令牌（rnapp/lib/theme.ts / prototype 的 :root） */
+  :root{
+    --canvas:#f4f1ea; --ink:#2b2a27; --ink-2:#5b5850; --ink-3:#8a867c;
+    --line:#d9d4c7; --celadon:#8fb5a5; --celadon-deep:#4f8a76; --rust:#b5533c;
+    --kai:"KaiTi","Kaiti SC","STKaiti","楷体",serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;background:var(--canvas);color:var(--ink);
+    font:16px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+    display:flex;justify-content:center;padding:56px 24px}
+  main{width:100%;max-width:420px}
+  h1{font:400 40px/1.15 var(--kai);margin:0}
+  .lead{font:400 17px/1.8 var(--kai);color:var(--ink-2);margin:12px 0 0}
+  .rule{border-top:1px dashed var(--celadon);margin:28px 0 22px}
+  label{display:block;font-size:14px;color:var(--ink-2);margin:16px 0 6px}
+  input{width:100%;height:46px;border:1px solid var(--line);border-radius:12px;
+    background:#fff;padding:0 14px;font-size:16px;color:var(--ink);outline:none}
+  input:focus{border-color:var(--celadon-deep)}
+  input.bad{border-color:var(--rust)}
+  .err{font-size:13px;color:var(--rust);margin:6px 0 0;min-height:1em}
+  button{width:100%;height:48px;margin-top:24px;border:0;border-radius:12px;
+    background:var(--celadon-deep);color:#fff;font-size:16px;cursor:pointer}
+  button[disabled]{opacity:.55;cursor:not-allowed}
+  .box{padding:16px;border-radius:12px;background:#fff;border:1px solid var(--line);margin-top:8px}
+  .box.ok{border-color:var(--celadon-deep)}
+  .box.fail{border-color:var(--rust)}
+  .hint{font-size:12px;color:var(--ink-3);text-align:center;margin-top:28px}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <h1>心意管家</h1>
+  <p class="lead">设置一个新的登录密码。</p>
+  <div class="rule"></div>
+
+  <!-- 状态：无有效链接 / 已失效 -->
+  <section id="invalid" class="box fail" hidden>
+    <strong>这个重置链接不可用</strong>
+    <p id="invalidMsg" style="margin:8px 0 0;color:var(--ink-2)"></p>
+    <p style="margin:8px 0 0;color:var(--ink-2)">请回到 App 登录页，点「忘记密码」重新发送一封邮件。</p>
+  </section>
+
+  <!-- 状态：输入新密码 -->
+  <form id="form" hidden novalidate>
+    <label for="pw1">新密码</label>
+    <input id="pw1" type="password" autocomplete="new-password" minlength="6">
+    <p class="err" id="e1"></p>
+
+    <label for="pw2">再输入一次</label>
+    <input id="pw2" type="password" autocomplete="new-password">
+    <p class="err" id="e2"></p>
+
+    <p class="err" id="eForm"></p>
+    <button id="submit" type="submit">设置新密码</button>
+  </form>
+
+  <!-- 状态：完成 -->
+  <section id="done" class="box ok" hidden>
+    <strong>密码已重置</strong>
+    <p style="margin:8px 0 0;color:var(--ink-2)">请回到「心意管家」App，用新密码登录。这个页面可以关闭了。</p>
+  </section>
+
+  <p class="hint">名单和心意记录都存在你的账号里，改密码不会影响它们。</p>
+</main>
+
+<script>
+(function () {
+  // 公开的项目地址与 publishable key（可公开；绝不能放 secret / service_role key）
+  var SUPABASE_URL = 'https://lajmfpxgmqgdpvydlvhf.supabase.co';
+  var PUBLISHABLE_KEY = 'sb_publishable_PkyvEqNX4nBjcE1rZfdyPQ_9v092RSm';
+  var MIN_PASSWORD = 6;
+
+  var $ = function (id) { return document.getElementById(id); };
+  function show(id) { ['invalid', 'form', 'done'].forEach(function (x) { $(x).hidden = x !== id; }); }
+
+  // 1) 从 # 片段取令牌，取完立刻从地址栏抹掉，避免被截图 / 历史记录留存
+  var hash = new URLSearchParams(location.hash.replace(/^#/, ''));
+  var query = new URLSearchParams(location.search);
+  var accessToken = hash.get('access_token');
+  var type = hash.get('type');
+  var urlError = hash.get('error_description') || query.get('error_description');
+  history.replaceState(null, '', location.pathname);
+
+  if (urlError) {
+    // Supabase 在链接失效 / 已用过时，会带 error_code=otp_expired 之类跳回来
+    $('invalidMsg').textContent = /expired|invalid/i.test(urlError)
+      ? '链接已过期，或者已经被使用过。' : '链接校验没有通过。';
+    show('invalid');
+    return;
+  }
+  if (!accessToken || type !== 'recovery') {
+    $('invalidMsg').textContent = '没有找到有效的重置信息，请从邮件里的链接打开本页。';
+    show('invalid');
+    return;
+  }
+  show('form');
+
+  // 2) 本地校验
+  function validate() {
+    var p1 = $('pw1').value, p2 = $('pw2').value, ok = true;
+    $('e1').textContent = ''; $('e2').textContent = ''; $('eForm').textContent = '';
+    $('pw1').classList.remove('bad'); $('pw2').classList.remove('bad');
+    if (p1.length < MIN_PASSWORD) {
+      $('e1').textContent = '密码至少需要 ' + MIN_PASSWORD + ' 位'; $('pw1').classList.add('bad'); ok = false;
+    }
+    if (p1 !== p2) {
+      $('e2').textContent = '两次输入的密码不一致'; $('pw2').classList.add('bad'); ok = false;
+    }
+    return ok;
+  }
+
+  function friendly(status, body) {
+    var m = ((body && (body.msg || body.message || body.error_description)) || '').toLowerCase();
+    if (status === 401 || status === 403 || m.indexOf('expired') > -1 || m.indexOf('invalid') > -1 && m.indexOf('jwt') > -1) {
+      return '链接已过期或已被使用，请回到 App 重新发送重置邮件。';
+    }
+    if (m.indexOf('different from the old') > -1 || m.indexOf('same_password') > -1) return '新密码不能和旧密码一样。';
+    if (m.indexOf('password') > -1 && (m.indexOf('characters') > -1 || m.indexOf('weak') > -1)) return '密码太简单，请换一个更长或更复杂的。';
+    if (status === 429) return '操作太频繁了，请稍后再试。';
+    return '重置失败，请稍后再试。';
+  }
+
+  // 3) 提交：用恢复令牌改密码
+  $('form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (!validate()) return;
+    var btn = $('submit');
+    btn.disabled = true; btn.textContent = '提交中…';
+
+    fetch(SUPABASE_URL + '/auth/v1/user', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': PUBLISHABLE_KEY,
+        'Authorization': 'Bearer ' + accessToken
+      },
+      body: JSON.stringify({ password: $('pw1').value })
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (body) { return { res: res, body: body }; });
+    }).then(function (r) {
+      if (r.res.ok) {
+        accessToken = null;
+        show('done');
+      } else {
+        $('eForm').textContent = friendly(r.res.status, r.body);
+        btn.disabled = false; btn.textContent = '设置新密码';
+      }
+    }).catch(function () {
+      $('eForm').textContent = '网络不通，请检查网络后再试。';
+      btn.disabled = false; btn.textContent = '设置新密码';
+    });
+  });
+})();
+</script>
+</body>
+</html>
