@@ -49,6 +49,7 @@
     <strong>这个重置链接不可用</strong>
     <p id="invalidMsg" style="margin:8px 0 0;color:var(--ink-2)"></p>
     <p style="margin:8px 0 0;color:var(--ink-2)">请回到 App 登录页，点「忘记密码」重新发送一封邮件。</p>
+    <p id="invalidCode" style="margin:8px 0 0;font-size:12px;color:var(--ink-3);word-break:break-all"></p>
   </section>
 
   <!-- 状态：输入新密码 -->
@@ -84,22 +85,31 @@
   var $ = function (id) { return document.getElementById(id); };
   function show(id) { ['invalid', 'form', 'done'].forEach(function (x) { $(x).hidden = x !== id; }); }
 
-  // 1) 从 # 片段取令牌，取完立刻从地址栏抹掉，避免被截图 / 历史记录留存
+  // 1) 从 # 片段（兼容 ? 查询串）取令牌，取完立刻从地址栏抹掉，避免被截图 / 历史记录留存
+  //    两种链接都支持：
+  //    - token_hash 方式（推荐）：邮件链接直达本页，令牌到点「设置新密码」时才校验，
+  //      邮箱安全扫描预访问链接不会把一次性令牌用掉；
+  //    - access_token 方式（Supabase 默认模板）：令牌在访问 Supabase 校验地址时已被消耗，易被扫描器烧掉。
   var hash = new URLSearchParams(location.hash.replace(/^#/, ''));
   var query = new URLSearchParams(location.search);
-  var accessToken = hash.get('access_token');
-  var type = hash.get('type');
-  var urlError = hash.get('error_description') || query.get('error_description');
+  function pick(k) { return hash.get(k) || query.get(k); }
+  var accessToken = pick('access_token');
+  var tokenHash = pick('token_hash');
+  var type = pick('type');
+  var urlError = pick('error_description');
+  var errorCode = pick('error_code');
   history.replaceState(null, '', location.pathname);
 
-  if (urlError) {
+  if (urlError || errorCode) {
     // Supabase 在链接失效 / 已用过时，会带 error_code=otp_expired 之类跳回来
-    $('invalidMsg').textContent = /expired|invalid/i.test(urlError)
-      ? '链接已过期，或者已经被使用过。' : '链接校验没有通过。';
+    var expired = errorCode === 'otp_expired' || /expired|invalid/i.test(urlError || '');
+    $('invalidMsg').textContent = expired ? '链接已过期，或者已经被使用过。' : '链接校验没有通过。';
+    // 错误码不是机密，显示出来便于排查
+    $('invalidCode').textContent = '错误信息：' + (errorCode || '-') + (urlError ? ' / ' + urlError : '');
     show('invalid');
     return;
   }
-  if (!accessToken || type !== 'recovery') {
+  if (!(accessToken || tokenHash) || type !== 'recovery') {
     $('invalidMsg').textContent = '没有找到有效的重置信息，请从邮件里的链接打开本页。';
     show('invalid');
     return;
@@ -122,7 +132,7 @@
 
   function friendly(status, body) {
     var m = ((body && (body.msg || body.message || body.error_description)) || '').toLowerCase();
-    if (status === 401 || status === 403 || m.indexOf('expired') > -1 || m.indexOf('invalid') > -1 && m.indexOf('jwt') > -1) {
+    if (status === 401 || status === 403 || status === 404 || status === 410 || m.indexOf('expired') > -1 || m.indexOf('invalid') > -1) {
       return '链接已过期或已被使用，请回到 App 重新发送重置邮件。';
     }
     if (m.indexOf('different from the old') > -1 || m.indexOf('same_password') > -1) return '新密码不能和旧密码一样。';
@@ -138,19 +148,37 @@
     var btn = $('submit');
     btn.disabled = true; btn.textContent = '提交中…';
 
-    fetch(SUPABASE_URL + '/auth/v1/user', {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': PUBLISHABLE_KEY,
-        'Authorization': 'Bearer ' + accessToken
-      },
-      body: JSON.stringify({ password: $('pw1').value })
-    }).then(function (res) {
-      return res.json().catch(function () { return {}; }).then(function (body) { return { res: res, body: body }; });
+    function call(method, path, token, payload) {
+      return fetch(SUPABASE_URL + path, {
+        method: method,
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': PUBLISHABLE_KEY,
+          'Authorization': 'Bearer ' + (token || PUBLISHABLE_KEY)
+        },
+        body: payload ? JSON.stringify(payload) : undefined
+      }).then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (body) { return { res: res, body: body }; });
+      });
+    }
+
+    // 先拿到恢复会话的令牌：token_hash 方式在此刻才校验（只消耗一次，成功后留在内存里供重试）
+    var ready = accessToken
+      ? Promise.resolve({ res: { ok: true } })
+      : call('POST', '/auth/v1/verify', null, { type: 'recovery', token_hash: tokenHash }).then(function (r) {
+          if (r.res.ok && r.body.access_token) { accessToken = r.body.access_token; }
+          else { r.res.ok = false; }
+          return r;
+        });
+
+    ready.then(function (v) {
+      if (!v.res.ok) return v;
+      return call('PUT', '/auth/v1/user', accessToken, { password: $('pw1').value });
     }).then(function (r) {
       if (r.res.ok) {
-        accessToken = null;
+        // 尽力让这次临时会话失效，不影响结果
+        call('POST', '/auth/v1/logout', accessToken).catch(function () {});
+        accessToken = null; tokenHash = null;
         show('done');
       } else {
         $('eForm').textContent = friendly(r.res.status, r.body);
